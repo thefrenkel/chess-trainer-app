@@ -86,6 +86,11 @@ input,textarea{font-family:inherit;outline:none}
 .btn-green{background:rgba(74,222,128,.15);color:#86efac}.btn-green:hover{filter:brightness(1.15)}
 .btn-icon{width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:10px;background:var(--border);color:var(--text);transition:all .15s}
 .btn-icon:hover{filter:brightness(1.15)}
+.sync-pill{display:inline-flex;align-items:center;min-height:30px;max-width:170px;padding:5px 9px;border-radius:999px;border:1px solid var(--border);background:var(--inner);color:var(--sub);font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sync-pill.ok{border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.10);color:#86efac}
+.sync-pill.busy{border-color:rgba(59,130,246,.35);background:rgba(59,130,246,.10);color:#93c5fd}
+.sync-pill.warn{border-color:rgba(245,158,11,.35);background:rgba(245,158,11,.10);color:#fcd34d}
+.sync-pill.err{border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.10);color:#fca5a5}
 
 /* Inputs */
 .inp{background:var(--inner);border:1px solid var(--border);color:var(--text);border-radius:10px;padding:8px 12px;font-size:14px;width:100%;transition:all .2s}
@@ -376,6 +381,9 @@ input,textarea{font-family:inherit;outline:none}
       </div>
     </div>
     <div class="header-btns">
+      <span class="sync-pill warn" id="cloudSyncStatus" title="Cloud sync status">Cloud setup needed</span>
+      <button class="btn btn-ghost" id="cloudSyncBtn" title="Sign in and sync across browsers">Setup Sync</button>
+      <button class="btn btn-ghost" id="cloudSignOutBtn" title="Sign out of cloud sync" style="display:none">Sign out</button>
       <button class="btn btn-ghost" id="gamesBtn" title="Open the games analysis app">Games</button>
       <button class="btn btn-ghost" id="exportBtn" title="Back up all saved dashboard data">Export</button>
       <button class="btn btn-ghost" id="importBtn" title="Restore dashboard data from a backup file">Import</button>
@@ -459,6 +467,31 @@ const SK = 'chess-trainer-v4';
 const STANDALONE_STORAGE_KEY = 'chess-trainer-analysis-v1';
 const LEGACY_STORAGE_KEYS = [SK, STANDALONE_STORAGE_KEY, 'chess-trainer-v1'];
 const STORAGE_RECOVERY_PREFIX = SK+'-recovery-';
+const CLOUD_SYNC_CONFIG = {
+  apiKey: 'AIzaSyBSghQNb-aJGnouoW4uW9iAVB_11qKpX6c',
+  authDomain: 'chess-trainer-app-86c23.firebaseapp.com',
+  projectId: 'chess-trainer-app-86c23',
+  storageBucket: 'chess-trainer-app-86c23.firebasestorage.app',
+  messagingSenderId: '945553840931',
+  appId: '1:945553840931:web:087563da9aee65fa3d8a96'
+};
+const CLOUD_SYNC_META_KEY = 'chess-trainer-cloud-sync-meta-v1';
+const CLOUD_SYNC_SDK_VERSION = '12.7.0';
+const CLOUD_SYNC_DEBOUNCE_MS = 15000;
+let cloudSyncState = {
+  configured: false,
+  initializing: false,
+  ready: false,
+  busy: false,
+  status: 'setup',
+  message: 'Cloud setup needed',
+  user: null,
+  app: null,
+  auth: null,
+  db: null,
+  modules: null
+};
+let cloudSyncPushTimer = 0;
 
 function readSavedDashboardState(){
   let best=null,bestScore=-1;
@@ -1402,7 +1435,12 @@ function getDay(k){return state.history[k]?safeNormalizeDay(k,state.history[k]):
 function ensureDay(k){if(!state.history[k])state.history[k]=eDay();state.history[k]=safeNormalizeDay(k,state.history[k]);return state.history[k]}
 let _persistTimer=0;
 function persist(){clearTimeout(_persistTimer);_persistTimer=setTimeout(_doPersist,200)}
-function _doPersist(){try{writeSavedDashboardState(state)}catch(e){}}
+function _doPersist(){
+  try{
+    writeSavedDashboardState(state);
+    cloudMarkLocalChange();
+  }catch(e){}
+}
 function pushDebugLog(scope,event,details){
   try{
     const entry={at:Date.now(),scope:String(scope||'app'),event:String(event||''),details:details||{}};
@@ -3510,6 +3548,7 @@ function render(){
   const vw=document.getElementById('volWrap');if(vw)vw.style.display=state.soundOn?'flex':'none';
   const vs=document.getElementById('volSlider');if(vs)vs.value=state.volume||60;
   const vl=document.getElementById('volLabel');if(vl)vl.textContent=(state.volume||60)+'%';
+  renderCloudSyncStatus();
 
   // Banner
   const dayToday=getDay(NOW());
@@ -5828,6 +5867,7 @@ function restoreStandaloneBackup(file){
       BACKUP_STORAGE_KEYS.forEach(function(key){
         if(typeof storage[key]==='string') localStorage.setItem(key,storage[key]);
       });
+      try{cloudMarkLocalChange({skipSchedule:true})}catch(_err){}
       window.location.reload();
     }catch(err){
       alert('That backup file could not be restored.');
@@ -5837,8 +5877,381 @@ function restoreStandaloneBackup(file){
 }
 
 // ═══════════════════════════════════════════════════════════
+// CLOUD SYNC
+// ═══════════════════════════════════════════════════════════
+function cloudReadConfig(){
+  const external=(typeof window!=='undefined'&&window.CHESS_TRAINER_FIREBASE_CONFIG&&typeof window.CHESS_TRAINER_FIREBASE_CONFIG==='object')
+    ? window.CHESS_TRAINER_FIREBASE_CONFIG
+    : {};
+  return {...CLOUD_SYNC_CONFIG,...external};
+}
+function cloudConfigReady(config){
+  config=config||cloudReadConfig();
+  return !!(config.apiKey&&config.authDomain&&config.projectId&&config.appId);
+}
+function readCloudMeta(){
+  try{
+    const raw=localStorage.getItem(CLOUD_SYNC_META_KEY);
+    return raw?JSON.parse(raw):{};
+  }catch(_err){return {}}
+}
+function writeCloudMeta(meta){
+  try{localStorage.setItem(CLOUD_SYNC_META_KEY,JSON.stringify(meta||{}))}catch(_err){}
+}
+function cloudSetStatus(status,message){
+  cloudSyncState.status=status||cloudSyncState.status;
+  cloudSyncState.message=message||cloudSyncState.message;
+  renderCloudSyncStatus();
+}
+function renderCloudSyncStatus(){
+  const pill=document.getElementById('cloudSyncStatus');
+  const btn=document.getElementById('cloudSyncBtn');
+  const signOutBtn=document.getElementById('cloudSignOutBtn');
+  if(!pill||!btn) return;
+  const configured=cloudConfigReady();
+  const user=cloudSyncState.user;
+  const busy=cloudSyncState.busy||cloudSyncState.initializing;
+  let cls='sync-pill ';
+  if(!configured) cls+='warn';
+  else if(cloudSyncState.status==='error') cls+='err';
+  else if(busy) cls+='busy';
+  else if(user) cls+='ok';
+  else cls+='warn';
+  pill.className=cls;
+  pill.textContent=busy?'Syncing...':(cloudSyncState.message||(!configured?'Cloud setup needed':(user?'Synced':'Local only')));
+  pill.title=user&&user.email?('Cloud sync: '+user.email):'Cloud sync status';
+  btn.textContent=!configured?'Setup Sync':(busy?'Syncing...':(user?'Sync now':'Sign in'));
+  btn.disabled=busy;
+  if(signOutBtn){
+    signOutBtn.style.display=(configured&&user&&!busy)?'inline-flex':'none';
+    signOutBtn.disabled=busy;
+  }
+}
+function cloudShowSetupInstructions(){
+  alert('Cloud sync is ready in the app, but Firebase is not configured yet. Create a Firebase project, enable Google sign-in and Firestore, then send me the Firebase web config object so I can add it here.');
+}
+function cloudFirebaseImports(){
+  const base='https://www.gstatic.com/firebasejs/'+CLOUD_SYNC_SDK_VERSION;
+  return Promise.all([
+    import(base+'/firebase-app.js'),
+    import(base+'/firebase-auth.js'),
+    import(base+'/firebase-firestore.js')
+  ]).then(function(mods){
+    return {app:mods[0],auth:mods[1],firestore:mods[2]};
+  });
+}
+async function cloudEnsureReady(){
+  const config=cloudReadConfig();
+  cloudSyncState.configured=cloudConfigReady(config);
+  if(!cloudSyncState.configured){
+    cloudSetStatus('setup','Cloud setup needed');
+    return false;
+  }
+  if(cloudSyncState.ready) return true;
+  if(cloudSyncState.initializing) return false;
+  cloudSyncState.initializing=true;
+  cloudSetStatus('busy','Starting sync...');
+  try{
+    const modules=await cloudFirebaseImports();
+    const app=modules.app.getApps().length?modules.app.getApp():modules.app.initializeApp(config);
+    const auth=modules.auth.getAuth(app);
+    const db=modules.firestore.getFirestore(app);
+    cloudSyncState.modules=modules;
+    cloudSyncState.app=app;
+    cloudSyncState.auth=auth;
+    cloudSyncState.db=db;
+    cloudSyncState.ready=true;
+    modules.auth.onAuthStateChanged(auth,function(user){
+      cloudSyncState.user=user||null;
+      if(user){
+        cloudSetStatus('ok','Signed in');
+        cloudSyncNow('sign_in');
+      }else{
+        cloudSetStatus('idle','Local only');
+      }
+    });
+    return true;
+  }catch(err){
+    console.error('[Chess Trainer] Cloud sync init failed',err);
+    cloudSetStatus('error','Sync setup error');
+    return false;
+  }finally{
+    cloudSyncState.initializing=false;
+    renderCloudSyncStatus();
+  }
+}
+function cloudUserDocRef(){
+  const modules=cloudSyncState.modules;
+  const user=cloudSyncState.user;
+  if(!modules||!user) return null;
+  return modules.firestore.doc(cloudSyncState.db,'users',user.uid,'apps','chess-trainer-analysis');
+}
+async function cloudSignIn(){
+  if(!cloudConfigReady()){
+    cloudShowSetupInstructions();
+    return;
+  }
+  const ready=await cloudEnsureReady();
+  if(!ready) return;
+  try{
+    cloudSyncState.busy=true;
+    cloudSetStatus('busy','Signing in...');
+    const provider=new cloudSyncState.modules.auth.GoogleAuthProvider();
+    await cloudSyncState.modules.auth.signInWithPopup(cloudSyncState.auth,provider);
+  }catch(err){
+    console.error('[Chess Trainer] Google sign-in failed',err);
+    cloudSetStatus('error','Sign-in failed');
+    alert('Google sign-in did not finish. Check that Firebase Authentication is enabled and that thefrenkel.github.io is an authorized domain.');
+  }finally{
+    cloudSyncState.busy=false;
+    renderCloudSyncStatus();
+  }
+}
+async function cloudSignOut(){
+  if(!cloudSyncState.auth||!cloudSyncState.modules) return;
+  try{
+    cloudSyncState.busy=true;
+    cloudSetStatus('busy','Signing out...');
+    await cloudSyncState.modules.auth.signOut(cloudSyncState.auth);
+    cloudSetStatus('idle','Local only');
+  }catch(err){
+    console.error('[Chess Trainer] Cloud sign-out failed',err);
+    cloudSetStatus('error','Sign-out failed');
+  }finally{
+    cloudSyncState.busy=false;
+    renderCloudSyncStatus();
+  }
+}
+function cloudMarkLocalChange(options){
+  const meta=readCloudMeta();
+  meta.localChangedAt=Date.now();
+  meta.dirty=true;
+  writeCloudMeta(meta);
+  if(!(options&&options.skipSchedule)) cloudScheduleAutoPush();
+}
+function cloudScheduleAutoPush(){
+  if(cloudSyncPushTimer) clearTimeout(cloudSyncPushTimer);
+  if(!cloudSyncState.user||!cloudSyncState.ready) return;
+  cloudSyncPushTimer=setTimeout(function(){
+    cloudSyncPushTimer=0;
+    cloudSyncNow('auto');
+  },CLOUD_SYNC_DEBOUNCE_MS);
+}
+function cloudCompactBackup(){
+  try{seedGamesAppStorage()}catch(_err){}
+  try{writeSavedDashboardState(state)}catch(_err){}
+  const storage={};
+  try{
+    const raw=localStorage.getItem(SK);
+    storage[SK]=raw||JSON.stringify(state||{});
+  }catch(_err){
+    storage[SK]=JSON.stringify(state||{});
+  }
+  try{
+    const gamesRaw=localStorage.getItem(GAMES_APP_STORAGE_KEY);
+    if(typeof gamesRaw==='string') storage[GAMES_APP_STORAGE_KEY]=gamesRaw;
+  }catch(_err){}
+  return {
+    app:'chess-trainer-analysis',
+    version:APP_VERSION,
+    exportedAt:new Date().toISOString(),
+    storage:storage
+  };
+}
+function cloudParseJson(raw){
+  try{return raw?JSON.parse(raw):null}catch(_err){return null}
+}
+function cloudBestDashboardFromBackup(backup){
+  const storage=backup&&backup.storage&&typeof backup.storage==='object'?backup.storage:{};
+  let best=null,bestScore=-1;
+  [SK,STANDALONE_STORAGE_KEY,'chess-trainer-v1'].forEach(function(key){
+    const parsed=cloudParseJson(storage[key]);
+    const score=stateRecoveryScore(parsed);
+    if(score>bestScore){
+      best=parsed;
+      bestScore=score;
+    }
+  });
+  return best;
+}
+function cloudGamesFromBackup(backup,dashboard){
+  const storage=backup&&backup.storage&&typeof backup.storage==='object'?backup.storage:{};
+  const direct=cloudParseJson(storage[GAMES_APP_STORAGE_KEY]);
+  if(direct&&typeof direct==='object') return direct;
+  const bridge=dashboard&&dashboard.gameAnalysis&&typeof dashboard.gameAnalysis==='object'?dashboard.gameAnalysis:null;
+  if(!bridge) return null;
+  return {
+    settings:bridge.settings||{},
+    books:bridge.books||{white:null,black:null},
+    games:Array.isArray(bridge.games)?bridge.games:[],
+    lastSyncedAt:Number(bridge.syncedAt)||null,
+    lastSyncError:null
+  };
+}
+function cloudClone(value){
+  try{return JSON.parse(JSON.stringify(value))}catch(_err){return value}
+}
+function cloudMergeDashboardStates(localDashboard,remoteDashboard){
+  const merged=cloudClone(localDashboard||remoteDashboard||{history:{}});
+  if(!merged.history||typeof merged.history!=='object') merged.history={};
+  if(remoteDashboard) mergeRecoverySnapshot(merged,cloudClone(remoteDashboard));
+  if(localDashboard) mergeRecoverySnapshot(merged,cloudClone(localDashboard));
+  return merged;
+}
+function cloudMergeGames(localGamesState,remoteGamesState){
+  if(!localGamesState&&!remoteGamesState) return null;
+  const local=localGamesState&&typeof localGamesState==='object'?localGamesState:{};
+  const remote=remoteGamesState&&typeof remoteGamesState==='object'?remoteGamesState:{};
+  const byId={};
+  function gameScore(game){
+    if(!game||typeof game!=='object') return 0;
+    const reviewAt=Number(game.review&&game.review.updatedAt)||0;
+    let size=0;
+    try{size=JSON.stringify(game).length}catch(_err){}
+    return reviewAt+size;
+  }
+  function push(game){
+    if(!game||!game.id) return;
+    const id=String(game.id);
+    if(!byId[id]||gameScore(game)>gameScore(byId[id])) byId[id]=game;
+  }
+  (Array.isArray(remote.games)?remote.games:[]).forEach(push);
+  (Array.isArray(local.games)?local.games:[]).forEach(push);
+  const mergedBooks={white:null,black:null,...(remote.books||{}),...(local.books||{})};
+  ['white','black'].forEach(function(color){
+    if(!mergedBooks[color]&&remote.books&&remote.books[color]) mergedBooks[color]=remote.books[color];
+  });
+  return {
+    settings:{...(remote.settings||{}),...(local.settings||{})},
+    books:mergedBooks,
+    games:Object.keys(byId).map(function(id){return byId[id]}).sort(function(a,b){return (Number(b&&b.playedAt)||0)-(Number(a&&a.playedAt)||0)}),
+    lastSyncedAt:Math.max(Number(local.lastSyncedAt)||0,Number(remote.lastSyncedAt)||0)||null,
+    lastSyncError:local.lastSyncError||remote.lastSyncError||null
+  };
+}
+function cloudMergeBackups(localBackup,remoteBackup){
+  const localDashboard=cloudBestDashboardFromBackup(localBackup);
+  const remoteDashboard=cloudBestDashboardFromBackup(remoteBackup);
+  const mergedDashboard=cloudMergeDashboardStates(localDashboard,remoteDashboard);
+  const mergedGames=cloudMergeGames(
+    cloudGamesFromBackup(localBackup,localDashboard),
+    cloudGamesFromBackup(remoteBackup,remoteDashboard)
+  );
+  const storage={};
+  storage[SK]=JSON.stringify(mergedDashboard||{history:{}});
+  if(mergedGames) storage[GAMES_APP_STORAGE_KEY]=JSON.stringify(mergedGames);
+  return {
+    app:'chess-trainer-analysis',
+    version:APP_VERSION,
+    exportedAt:new Date().toISOString(),
+    storage:storage
+  };
+}
+function cloudApplyBackupLocally(backup,cloudUpdatedAt){
+  const storage=backup&&backup.storage&&typeof backup.storage==='object'?backup.storage:{};
+  const dashboardRaw=typeof storage[SK]==='string'?storage[SK]:(typeof storage[STANDALONE_STORAGE_KEY]==='string'?storage[STANDALONE_STORAGE_KEY]:storage['chess-trainer-v1']);
+  if(dashboardRaw){
+    [SK,STANDALONE_STORAGE_KEY,'chess-trainer-v1'].forEach(function(key){
+      try{localStorage.setItem(key,dashboardRaw)}catch(_err){}
+    });
+  }
+  if(typeof storage[GAMES_APP_STORAGE_KEY]==='string'){
+    try{localStorage.setItem(GAMES_APP_STORAGE_KEY,storage[GAMES_APP_STORAGE_KEY])}catch(_err){}
+  }
+  const meta=readCloudMeta();
+  meta.cloudUpdatedAt=Number(cloudUpdatedAt)||Date.now();
+  meta.lastPulledAt=Date.now();
+  meta.localChangedAt=0;
+  meta.dirty=false;
+  writeCloudMeta(meta);
+}
+async function cloudWriteBackup(backup,reason){
+  const ref=cloudUserDocRef();
+  if(!ref) throw new Error('Not signed in');
+  const updatedAt=Date.now();
+  await cloudSyncState.modules.firestore.setDoc(ref,{
+    app:'chess-trainer-analysis',
+    version:APP_VERSION,
+    updatedAt:updatedAt,
+    updatedAtIso:new Date(updatedAt).toISOString(),
+    reason:reason||'manual',
+    writer:{
+      uid:cloudSyncState.user.uid,
+      email:cloudSyncState.user.email||''
+    },
+    backup:backup
+  },{merge:true});
+  const meta=readCloudMeta();
+  meta.cloudUpdatedAt=updatedAt;
+  meta.lastPushedAt=Date.now();
+  meta.localChangedAt=0;
+  meta.dirty=false;
+  writeCloudMeta(meta);
+  return updatedAt;
+}
+async function cloudSyncNow(reason){
+  if(!cloudConfigReady()){
+    cloudShowSetupInstructions();
+    renderCloudSyncStatus();
+    return;
+  }
+  const ready=await cloudEnsureReady();
+  if(!ready) return;
+  if(!cloudSyncState.user){
+    await cloudSignIn();
+    return;
+  }
+  if(cloudSyncState.busy&&reason!=='sign_in') return;
+  cloudSyncState.busy=true;
+  cloudSetStatus('busy','Syncing...');
+  try{
+    const ref=cloudUserDocRef();
+    const localBackup=cloudCompactBackup();
+    const snap=await cloudSyncState.modules.firestore.getDoc(ref);
+    const remote=snap.exists()?snap.data():null;
+    const meta=readCloudMeta();
+    if(!remote||!remote.backup){
+      await cloudWriteBackup(localBackup,reason||'first_sync');
+      cloudSetStatus('ok','Synced');
+      return;
+    }
+    const remoteUpdatedAt=Number(remote.updatedAt)||0;
+    const knownCloudUpdatedAt=Number(meta.cloudUpdatedAt)||0;
+    const localChangedAt=Number(meta.localChangedAt)||0;
+    const localDirty=!!meta.dirty||localChangedAt>knownCloudUpdatedAt;
+    if(!localDirty&&remoteUpdatedAt<=knownCloudUpdatedAt){
+      cloudSetStatus('ok','Synced');
+      return;
+    }
+    if(localDirty&&remoteUpdatedAt<=knownCloudUpdatedAt){
+      await cloudWriteBackup(localBackup,reason||'local_changes');
+      cloudSetStatus('ok','Synced');
+      return;
+    }
+    const mergedBackup=cloudMergeBackups(localBackup,remote.backup);
+    const newUpdatedAt=await cloudWriteBackup(mergedBackup,reason||'merge');
+    cloudApplyBackupLocally(mergedBackup,newUpdatedAt);
+    cloudSetStatus('ok','Synced');
+    window.location.reload();
+  }catch(err){
+    console.error('[Chess Trainer] Cloud sync failed',err);
+    cloudSetStatus('error','Sync failed');
+    alert('Cloud sync failed. If you just created Firebase, check Firestore rules, Google sign-in, and the authorized domain.');
+  }finally{
+    cloudSyncState.busy=false;
+    renderCloudSyncStatus();
+  }
+}
+function cloudInitOnLoad(){
+  renderCloudSyncStatus();
+  if(cloudConfigReady()) cloudEnsureReady();
+}
+
+// ═══════════════════════════════════════════════════════════
 // HEADER BUTTONS
 // ═══════════════════════════════════════════════════════════
+document.getElementById('cloudSyncBtn').onclick=()=>{if(state.soundOn)sndClick();cloudSyncNow('manual')};
+document.getElementById('cloudSignOutBtn').onclick=()=>{if(state.soundOn)sndClick();cloudSignOut()};
 document.getElementById('themeBtn').onclick=()=>{state.isDark=!state.isDark;persist();render()};
 document.getElementById('soundBtn').onclick=()=>{state.soundOn=!state.soundOn;persist();render();if(state.soundOn)sndClick()};
 document.getElementById('resetBtn').onclick=()=>{sndClick();stopAllTimersEverywhere();state.history[NOW()]=eDay();persist();selectedDay=NOW();render()};
@@ -5919,6 +6332,7 @@ try{
     try{writeSavedDashboardState(state)}catch(_err){}
   }
   render();
+  cloudInitOnLoad();
 }catch(err){
   console.error('[Chess Trainer] Initial render failed. Saved dashboard state was not reset.', err);
   try{

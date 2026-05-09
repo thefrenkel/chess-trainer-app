@@ -451,10 +451,9 @@ const RATING_SERIES = {
   lcBullet:{label:'Lichess Bullet',color:'#f97316'},
   lcPuzzle:{label:'Lichess Tactics',color:'#a855f7'},
 };
-const APP_VERSION = 'v2026.04.04.20';
+const APP_VERSION = 'v2026.05.09.2';
 const CHESSABLE_AGGREGATE_START_DAY = '2026-03-30';
 const AUTO_TACTIC_SECONDS_PER_PUZZLE = 45;
-const MIN_LICHESS_API_TACTIC_SECONDS = 10 * 60;
 const AUTO_PUZZLE_RUSH_SECONDS_PER_PUZZLE = 45;
 const DISPLAY_PUZZLE_RUSH_SECONDS_PER_ATTEMPT = 6;
 const TACTIC_ESTIMATE_MIN_SECONDS_PER_PUZZLE = 8;
@@ -629,10 +628,12 @@ function readRecoveryDiagnostics(){
     return {key:entry.key,score:entry.score,days:hist,ts:entry.ts};
   });
 }
+function debugModeEnabled(){
+  try{return localStorage.getItem('chess-trainer-debug')==='1'||/[?&]debug=1\b/.test(location.search)}catch(_err){}
+  return false;
+}
 function renderRecoveryDiagnostics(){
-  let debug=false;
-  try{debug=localStorage.getItem('chess-trainer-debug')==='1'||/[?&]debug=1\b/.test(location.search)}catch(_err){}
-  if(!debug) return '';
+  if(!debugModeEnabled()) return '';
   const diagnostics=readRecoveryDiagnostics();
   if(!diagnostics.length) return '';
   const currentScore=stateRecoveryScore(state);
@@ -1014,6 +1015,29 @@ function sanitizeGameBreakdown(raw){
 function sumGameBreakdownCounts(breakdown){
   return Object.keys(gameTypeBreakdown()).reduce((sum,key)=>sum+(Number(breakdown&&breakdown[key])||0),0);
 }
+function isExternalGameClearEntry(entry){
+  if(!entry||typeof entry!=='object') return false;
+  const byType=sanitizeGameBreakdown(entry.byType);
+  const games=Math.max(0,Number(entry.games)||sumGameBreakdownCounts(byType));
+  return !!entry.cleared||(games<=0&&Number(entry.syncedAt)>0);
+}
+function normalizeExternalGameSyncEntry(entry){
+  const raw=entry&&typeof entry==='object'?entry:{};
+  const byType=sanitizeGameBreakdown(raw.byType);
+  const games=Math.max(0,Number(raw.games)||sumGameBreakdownCounts(byType));
+  const autoSeconds=Math.max(0,Number(raw.autoSeconds)||0,estimateGameBreakdownAutoSeconds(byType));
+  const points=Math.max(0,Number(raw.points)||parseGameScorePoints(raw.scoreText));
+  return {
+    games:games,
+    byType:byType,
+    autoSeconds:games>0?autoSeconds:0,
+    points:games>0?points:0,
+    scoreText:games>0?(raw.scoreText||fmtGameScore(points,games)):'',
+    latestType:games>0?normalizeGameType(raw.latestType):'',
+    syncedAt:Number(raw.syncedAt)||Date.now(),
+    cleared:isExternalGameClearEntry(raw)
+  };
+}
 function parseGameScorePoints(scoreText){
   const match=String(scoreText||'').match(/^\s*([0-9]+(?:\.[0-9]+)?)\s*\/\s*[0-9]+\s*$/);
   if(!match) return 0;
@@ -1026,8 +1050,10 @@ function summarizeExternalGamePlatformEntries(platforms){
   Object.keys(platforms||{}).forEach(function(platform){
     const entry=platforms[platform]||{};
     if(!GAME_PLATFORMS[platform]) return;
+    if(isExternalGameClearEntry(entry)) return;
     const byType=sanitizeGameBreakdown(entry.byType);
     const games=Math.max(0,Number(entry.games)||sumGameBreakdownCounts(byType));
+    if(games<=0&&!sumGameBreakdownCounts(byType)) return;
     const fallbackType=normalizeGameType(entry.latestType)||(platform==='chessiverse'?'rapid':'');
     const breakdownSeconds=estimateGameBreakdownAutoSeconds(byType);
     const autoSeconds=Math.max(0,Number(entry.autoSeconds)||0,breakdownSeconds,(fallbackType?games*gameTypeAutoMinutes(fallbackType)*60:0));
@@ -1232,6 +1258,26 @@ function renderExternalGameDebugSummary(){
   const lcStatus=lcData.loading?'loading':lcData.error?('error '+lcData.error):(lcData.lastFetch?('loaded '+getLichessGamesForDay(NOW()).length+' today / '+((lcData.recentGames||[]).length)+' recent'):'not loaded')+(lcAnalysis?' · analysis '+lcAnalysis+' today':'');
   return '<div style="margin:2px 0 10px;padding:9px 12px;border-radius:10px;background:rgba(148,163,184,.07);border:1px solid rgba(148,163,184,.16);font-size:11px;color:var(--sub)">Game sync: Chess.com '+esc(ccStatus)+' · Lichess '+esc(lcStatus)+'</div>';
 }
+function renderDebugLogSummary(){
+  if(!debugModeEnabled()) return '';
+  const logs=Array.isArray(state.debugLogs)?state.debugLogs.slice(-8).reverse():[];
+  if(!logs.length) return '';
+  const items=logs.map(function(log){
+    let details='';
+    try{details=JSON.stringify(log.details||{})}catch(_err){}
+    if(details.length>180) details=details.slice(0,177)+'...';
+    const time=log.at?new Date(log.at).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',second:'2-digit'}):'';
+    return '<div style="padding:5px 0;border-top:1px solid rgba(148,163,184,.12)">'
+      +'<strong style="color:var(--text)">'+esc(log.scope)+'/'+esc(log.event)+'</strong>'
+      +(time?' <span style="color:var(--muted)">'+esc(time)+'</span>':'')
+      +(details?' <span style="color:var(--sub)">'+esc(details)+'</span>':'')
+      +'</div>';
+  }).join('');
+  return '<div style="margin-top:12px;padding:10px 12px;border-radius:12px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.18);font-size:11px;color:var(--sub)">'
+    +'<strong style="color:var(--text)">Debug log:</strong> '+APP_VERSION
+    +items
+    +'</div>';
+}
 function fmtAgo(ts){const d=Math.floor((Date.now()-ts)/1000);if(d<60)return 'just now';if(d<3600)return Math.floor(d/60)+'m ago';if(d<86400)return Math.floor(d/3600)+'h ago';return Math.floor(d/86400)+'d ago'}
 function scoreText(score){return score+'/'+TK.length}
 function trackerSourceLabel(sync){
@@ -1393,6 +1439,7 @@ Object.keys(state.history).forEach(key=>{state.history[key]=safeNormalizeDay(key
 if(!('lastTrackerSync' in state)) state.lastTrackerSync=null;
 if(!('lastOpeningCourseName' in state)) state.lastOpeningCourseName='';
 if(!('autoRefreshExternalOnLoad' in state)) state.autoRefreshExternalOnLoad=true;
+state.autoRefreshExternalOnLoad=true;
 state.ratingGraphFilters={cv:true,ccRapid:true,ccBlitz:false,ccBullet:false,lcRapid:false,lcBlitz:false,lcBullet:false,lcPuzzle:false,...(state.ratingGraphFilters||{})};
 if(!state.sectionOrder)state.sectionOrder=[...SECS];
 if(!state.last7RangeEnd || state.last7RangeEnd<NOW())state.last7RangeEnd=NOW();
@@ -1448,6 +1495,7 @@ function pushDebugLog(scope,event,details){
     state.debugLogs.push(entry);
     state.debugLogs=state.debugLogs.slice(-80);
     console.info('[Chess Trainer]',scope,event,details||{});
+    try{writeSavedDashboardState(state)}catch(_err){}
   }catch(_err){}
 }
 function saveCVHistorySnapshot(){
@@ -1474,8 +1522,14 @@ function externalGameSyncDayKeys(){
 function externalGameSyncDayKeySet(){
   return new Set(externalGameSyncDayKeys());
 }
-function recentGameFallbackStartMs(){
-  return Date.now() - 24 * 60 * 60 * 1000;
+function externalGameDisplayStartKey(){
+  return addD(NOW(),-EXTERNAL_GAME_RECENT_DISPLAY_DAYS);
+}
+function externalGameDisplayDayKeys(){
+  return buildDateRange(externalGameDisplayStartKey(),NOW());
+}
+function externalGameDisplayDayKeySet(){
+  return new Set(externalGameDisplayDayKeys());
 }
 function normalizeTimestampMs(value){
   if(typeof value==='number'&&Number.isFinite(value)){
@@ -1493,16 +1547,9 @@ function dateKeyFromTimestamp(value){
 }
 function filterGamesForDisplayDay(dayKey,games,getGameMs){
   const list=Array.isArray(games)?games:[];
-  const exact=list.filter(function(game){
-    const ms=getGameMs(game);
-    return ms&&dk(new Date(ms))===dayKey;
-  });
-  if(dayKey!==NOW()||exact.length) return exact;
-  const start=recentGameFallbackStartMs();
-  const end=Date.now()+5*60*1000;
   return list.filter(function(game){
     const ms=getGameMs(game);
-    return ms>=start&&ms<=end;
+    return ms&&dk(new Date(ms))===dayKey;
   });
 }
 function fillForward(keys,sourceMap){
@@ -1600,6 +1647,8 @@ const CC_DEFAULT_USER = '';
 const LEGACY_CC_DEFAULT_USER = 'deepdream';
 const LC_DEFAULT_USER = 'thefrenkel';
 const EXTERNAL_GAME_SYNC_LOOKBACK_DAYS = 2;
+const EXTERNAL_GAME_RECENT_DISPLAY_DAYS = 45;
+const EXTERNAL_GAME_PANEL_LIMIT = 10;
 function sameUser(a,b){return String(a||'').trim().toLowerCase()===String(b||'').trim().toLowerCase()}
 function ccEmptyData(){return {stats:null,games:null,history:{rapid:{},blitz:{},bullet:{}},loading:false,error:null,lastFetch:0}}
 function lcEmptyData(){return {profile:null,todayGames:[],recentGames:[],storm:null,activity:[],puzzleActivityByDay:{},history:{rapid:{},blitz:{},bullet:{},puzzle:{}}, todayPuzzleCount:0, todayPuzzleWins:0, todayPuzzleLosses:0, todayPuzzleDraws:0, todayPuzzleRatingBefore:null, todayPuzzleRatingAfter:null, todayPuzzleRatingDelta:null, loading:false, error:null, lastFetch:0}}
@@ -1668,11 +1717,15 @@ function getTrustedChessComTacticsSeconds(day,fallbackCount,dailyOverride){
   );
 }
 function estimateLichessPuzzleSeconds(count){
-  return estimateTacticsSecondsFromTrackerHistory('lichess',count,AUTO_TACTIC_SECONDS_PER_PUZZLE);
+  const safeCount=Math.max(0,Number(count)||0);
+  return safeCount?Math.round(safeCount*AUTO_TACTIC_SECONDS_PER_PUZZLE):0;
 }
 function estimateLichessApiPuzzleSeconds(count){
   const safeCount=Math.max(0,Number(count)||0);
-  return safeCount?Math.max(MIN_LICHESS_API_TACTIC_SECONDS,estimateLichessPuzzleSeconds(safeCount)):0;
+  return estimateLichessPuzzleSeconds(safeCount);
+}
+function normalizeLichessTacticsSyncSeconds(count,seconds){
+  return Math.max(Math.max(0,Number(seconds)||0),estimateLichessApiPuzzleSeconds(count));
 }
 function finiteNumberOrNull(value){
   if(value===null||value===undefined||value==='') return null;
@@ -1776,19 +1829,24 @@ function looksLikeEstimatedLichessTacticsSeconds(day,stats){
 }
 function getTrustedLichessTacticsSeconds(day,statsOverride){
   const stats=statsOverride||tacticsToolStats(day,'lichess');
+  const storedCount=Math.max(0,Number(stats&&stats.count)||0);
   const storedElapsed=Math.max(0,Number(stats&&stats.elapsedSeconds)||0);
   const storedTrustedElapsed=looksLikeEstimatedLichessTacticsSeconds(day,stats)?0:storedElapsed;
   const apiActivity=getStoredLichessPuzzleActivity(day);
+  const apiCount=apiActivity?Math.max(0,Number(apiActivity.count)||0):0;
   const trackerCount=getTrackerTacticsSessions(day,'lichess').reduce(function(sum,session){
     return sum+Math.max(0,Number(session&&session.addCount)||0);
   },0);
-  const untrackedApiCount=apiActivity?Math.max(0,(Number(apiActivity.count)||0)-trackerCount):0;
+  const syncedCount=Math.max(storedCount,apiCount);
+  const apiEstimatedTotal=syncedCount?estimateLichessApiPuzzleSeconds(syncedCount):0;
+  const untrackedApiCount=apiActivity?Math.max(0,apiCount-trackerCount):0;
   const apiEstimatedElapsed=untrackedApiCount?estimateLichessApiPuzzleSeconds(untrackedApiCount):0;
   const trackerElapsed=getTrackerTacticsElapsedSeconds(day,'lichess');
   return Math.max(
     storedTrustedElapsed,
     trackerElapsed+apiEstimatedElapsed,
-    trackerElapsed
+    trackerElapsed,
+    apiEstimatedTotal
   );
 }
 function estimateGameBreakdownAutoSeconds(breakdown){
@@ -2377,9 +2435,12 @@ function applyStoredTrackerSessionRecovery(merged,day){
       }
     }else{
       const tacticSource=TACTIC_TOOLS[session.source]?session.source:'chessable';
+      const sessionSeconds=tacticSource==='lichess'
+        ? normalizeLichessTacticsSyncSeconds(session.addCount,session.addSeconds)
+        : session.addSeconds;
       merged.tacticsPlatform=tacticSource;
       merged.tacticsBreakdown[tacticSource].count+=(session.addCount||0);
-      merged.tacticsBreakdown[tacticSource].elapsedSeconds+=(session.addSeconds||0);
+      merged.tacticsBreakdown[tacticSource].elapsedSeconds+=(sessionSeconds||0);
       if(tacticSource==='chessable'&&session.courseName){
         applyTacticsCourseSync(merged,{
           courseName:session.courseName,
@@ -2389,6 +2450,7 @@ function applyStoredTrackerSessionRecovery(merged,day){
         });
       }
       syncMeta.source=tacticSource;
+      syncMeta.addSeconds=sessionSeconds;
     }
     applied.add(session.id);
     changed=true;
@@ -3662,6 +3724,7 @@ function renderToday(dayData,streaks){
 
   h+=renderTrackerSyncSummary(selectedDay,dayData);
   h+=renderRecoveryDiagnostics();
+  h+=renderDebugLogSummary();
 
   // Stats grid (merged)
   h+='<div class="stats-grid" style="margin-top:12px">'
@@ -4115,30 +4178,74 @@ function buildGameSyncSummary(platform,games,extractType,extractOutcome){
   });
   return {platform:platform,games:list.length,byType:byType,autoSeconds:autoSeconds,points:points,scoreText:fmtGameScore(points,list.length),latestType:latestType,syncedAt:Date.now()};
 }
+function syncGamesTaskFromExternalTotals(day,oldTotals){
+  if(!day||!day.tasks||!day.tasks.games) return summarizeExternalGamePlatforms(day);
+  const totals=summarizeExternalGamePlatforms(day);
+  const task=day.tasks.games;
+  const oldGames=Math.max(0,Number(oldTotals&&oldTotals.games)||0);
+  const oldSeconds=Math.max(0,Number(oldTotals&&oldTotals.autoSeconds)||0);
+  const currentGames=Math.max(0,Number(task.count)||0);
+  const currentSeconds=Math.max(0,Number(task.elapsedSeconds)||0);
+  if(currentGames<=oldGames){
+    task.count=totals.games;
+  }else if(totals.games>0){
+    task.count=Math.max(currentGames,totals.games);
+  }
+  if(!task.timerRunning&&currentSeconds<=oldSeconds){
+    task.elapsedSeconds=totals.autoSeconds;
+  }else if(totals.autoSeconds>0){
+    task.elapsedSeconds=Math.max(currentSeconds,totals.autoSeconds);
+  }
+  if(totals.games>0){
+    day.started=true;
+    if(task.count>=2) task.done=true;
+    else if(oldGames>0&&currentGames<=oldGames&&task.done) task.done=false;
+    if(totals.latestPlatform&&GAME_PLATFORMS[totals.latestPlatform]) day.gamePlatform=totals.latestPlatform;
+    if(totals.latestType&&GAME_TYPES[totals.latestType]) day.gameType=totals.latestType;
+  }else if(oldGames>0&&task.count<2&&task.done){
+    task.done=false;
+  }
+  const currentScore=String(day.dailyScore||'').trim();
+  const oldScore=String(oldTotals&&oldTotals.scoreText||'').trim();
+  if(totals.scoreText){
+    if(!currentScore||currentScore===oldScore) day.dailyScore=totals.scoreText;
+  }else if(currentScore&&currentScore===oldScore){
+    day.dailyScore='';
+  }
+  return totals;
+}
 function applyExternalGamesToDay(dayKey,platform,summary){
+  if(!GAME_PLATFORMS[platform]) return false;
   const syncSummary=summary&&typeof summary==='object'?summary:{platform:platform,games:Number(summary)||0,byType:gameTypeBreakdown(),autoSeconds:0,latestType:'',syncedAt:Date.now()};
   const count=Math.max(0,Number(syncSummary.games)||0);
-  if(count<=0) return false;
-  const day=ensureDay(dayKey);
+  const existingDay=state.history&&state.history[dayKey];
+  if(count<=0&&!(existingDay&&existingDay.lastExternalGameSync&&existingDay.lastExternalGameSync[platform])) return false;
+  const day=count>0?ensureDay(dayKey):existingDay;
   if(!day.lastExternalGameSync||typeof day.lastExternalGameSync!=='object') day.lastExternalGameSync={};
-  day.lastExternalGameSync[platform]={
-    games:count,
-    byType:sanitizeGameBreakdown(syncSummary.byType),
-    autoSeconds:Math.max(0,Number(syncSummary.autoSeconds)||0),
-    points:Math.max(0,Number(syncSummary.points)||0),
-    scoreText:syncSummary.scoreText||'',
-    latestType:normalizeGameType(syncSummary.latestType),
-    syncedAt:Number(syncSummary.syncedAt)||Date.now()
-  };
-  const totals=summarizeExternalGamePlatforms(day);
-  day.tasks.games.count=Math.max(day.tasks.games.count||0,totals.games);
-  day.tasks.games.elapsedSeconds=Math.max(day.tasks.games.elapsedSeconds||0,totals.autoSeconds);
-  day.tasks.games.done=true;
-  day.started=true;
-  if(totals.latestPlatform&&GAME_PLATFORMS[totals.latestPlatform]) day.gamePlatform=totals.latestPlatform;
-  if(totals.latestType&&GAME_TYPES[totals.latestType]) day.gameType=totals.latestType;
-  const autoScore=totals.scoreText;
-  if(autoScore) day.dailyScore=autoScore;
+  const oldTotals=summarizeExternalGamePlatforms(day);
+  if(count>0){
+    day.lastExternalGameSync[platform]={
+      games:count,
+      byType:sanitizeGameBreakdown(syncSummary.byType),
+      autoSeconds:Math.max(0,Number(syncSummary.autoSeconds)||0),
+      points:Math.max(0,Number(syncSummary.points)||0),
+      scoreText:syncSummary.scoreText||'',
+      latestType:normalizeGameType(syncSummary.latestType),
+      syncedAt:Number(syncSummary.syncedAt)||Date.now()
+    };
+  }else{
+    day.lastExternalGameSync[platform]={
+      games:0,
+      byType:gameTypeBreakdown(),
+      autoSeconds:0,
+      points:0,
+      scoreText:'',
+      latestType:'',
+      syncedAt:Number(syncSummary.syncedAt)||Date.now(),
+      cleared:true
+    };
+  }
+  syncGamesTaskFromExternalTotals(day,oldTotals);
   persist();
   return true;
 }
@@ -4147,15 +4254,17 @@ function applyExternalGamesToToday(platform,summary){
 }
 function applyExternalGamesByDate(platform,games,extractDayKey,extractType,extractOutcome){
   const groups={};
-  const allowedDays=externalGameSyncDayKeySet();
+  const allowedDays=externalGameSyncDayKeys();
+  const allowedDaySet=new Set(allowedDays);
   (Array.isArray(games)?games:[]).forEach(function(game){
     const dayKey=extractDayKey(game);
-    if(!dayKey||!allowedDays.has(dayKey)) return;
+    if(!dayKey||!allowedDaySet.has(dayKey)) return;
     if(!groups[dayKey]) groups[dayKey]=[];
     groups[dayKey].push(game);
   });
-  return Object.keys(groups).sort().reduce(function(applied,dayKey){
-    return applyExternalGamesToDay(dayKey,platform,buildGameSyncSummary(platform,groups[dayKey],extractType,extractOutcome))||applied;
+  return allowedDays.reduce(function(applied,dayKey){
+    const dayGames=groups[dayKey]||[];
+    return applyExternalGamesToDay(dayKey,platform,buildGameSyncSummary(platform,dayGames,extractType,extractOutcome))||applied;
   },false);
 }
 function gamesAppGameMs(game){
@@ -4221,16 +4330,17 @@ function applyChessiverseSyncToToday(){
     latestType:syncSummary.latestType,
     syncedAt:syncSummary.syncedAt
   };
-  day.tasks.games.count=summary.games;
-  day.tasks.games.elapsedSeconds=Math.max(day.tasks.games.elapsedSeconds||0,syncSummary.autoSeconds);
-  if(summary.games>0){
+  const totals=summarizeExternalGamePlatforms(day);
+  day.tasks.games.count=Math.max(day.tasks.games.count||0,totals.games);
+  day.tasks.games.elapsedSeconds=Math.max(day.tasks.games.elapsedSeconds||0,totals.autoSeconds);
+  if(totals.games>0){
     day.tasks.games.done=true;
   }
-  day.dailyScore=summary.scoreText||'';
+  day.dailyScore=totals.scoreText||summary.scoreText||'';
   if(cvData.rating) day.dailyElo=String(cvData.rating).replace(/[^0-9]/g,'');
   day.started=true;
   persist();
-  return summary.games>0;
+  return totals.games>0;
 }
 
 function renderChessiverse(){
@@ -4359,10 +4469,7 @@ function syncChessComGamesToHistory(reason){
     ccData.history={rapid:(c.history&&c.history.rapid)||oldFlatHistory||{},blitz:(c.history&&c.history.blitz)||{},bullet:(c.history&&c.history.bullet)||{}};
     ccData.lastFetch=c.lastFetch||0;
     if(ccData.games.length&&syncChessComGamesToHistory('cache_restore')) persist();
-    // Default behavior: always refresh external data on page load.
-    if(state.autoRefreshExternalOnLoad!==false){
-      setTimeout(()=>ccFetch(),stale||missingHistory?250:500);
-    }
+    setTimeout(()=>ccFetch(),stale||missingHistory?250:500);
   } else {
     if(state.ccCache && !sameUser(state.ccCache.username,getCCUser())) delete state.ccCache;
     // No cache yet — auto-fetch on startup once a username has been set.
@@ -4385,7 +4492,7 @@ function ccFetch(){
   const userPath=encodeURIComponent(user);
   const now=new Date();
   const archiveMonths=[];
-  const recentDayKeys=externalGameSyncDayKeySet();
+  const displayDayKeys=externalGameDisplayDayKeySet();
   for(let i=5;i>=0;i--){
     const d=new Date(now.getFullYear(),now.getMonth()-i,1);
     archiveMonths.push({
@@ -4426,7 +4533,7 @@ function ccFetch(){
           if(mySide&&typeof mySide.rating==='number'&&history[game.time_class]){
             history[game.time_class][endDate]=mySide.rating;
           }
-          if(!recentDayKeys.has(endDate)) return;
+          if(!displayDayKeys.has(endDate)) return;
           const gameKey=game.url||game.uuid||(game.end_time+'_'+((game.white&&game.white.rating)||'')+'_'+((game.black&&game.black.rating)||''));
           if(recentSeen.has(gameKey)) return;
           recentSeen.add(gameKey);
@@ -4466,6 +4573,21 @@ function ccGamesForDay(dayKey){
 function ccTodayGames(){
   return ccGamesForDay(NOW());
 }
+function getChessComRecentGamesForDisplay(){
+  const seen=new Set();
+  return (Array.isArray(ccData.games)?ccData.games:[])
+    .filter(function(game){
+      return game&&game.end_time&&normalizeGameType(game.time_class);
+    })
+    .sort(function(a,b){return (b.end_time||0)-(a.end_time||0);})
+    .filter(function(game){
+      const key=game.url||game.uuid||(game.end_time+'_'+((game.white&&game.white.rating)||'')+'_'+((game.black&&game.black.rating)||''));
+      if(seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0,EXTERNAL_GAME_PANEL_LIMIT);
+}
 
 function ccPlayerResult(g){
   const isWhite=g.white&&g.white.username&&g.white.username.toLowerCase()===getCCUser().toLowerCase();
@@ -4496,7 +4618,8 @@ function renderRecentGameList(title,items){
 function renderTodayGameList(items){
   if(!Array.isArray(items)||!items.length) return '';
   let h='<div style="margin-top:4px">';
-  items.slice(0,10).forEach(function(item){
+  const displayItems=items.slice(0,EXTERNAL_GAME_PANEL_LIMIT);
+  displayItems.forEach(function(item){
     h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;border-radius:8px;background:var(--inner);border:1px solid var(--border);margin-bottom:4px;font-size:12px">';
     h+='<span style="display:inline-block;width:12px;height:12px;border-radius:50%;background:'+item.colorDot+';border:1.5px solid '+item.colorBorder+';flex-shrink:0" title="'+item.colorTitle+'"></span>';
     h+='<span style="font-weight:600;color:'+item.resultColor+'">'+item.resultLabel+'</span>';
@@ -4506,7 +4629,7 @@ function renderTodayGameList(items){
     if(item.dateLabel) h+='<span style="color:var(--sub);font-size:10px;min-width:48px;text-align:right">'+esc(item.dateLabel)+'</span>';
     h+='</div>';
   });
-  if(items.length>10) h+='<div style="font-size:11px;color:var(--muted);text-align:center;padding:4px">+'+(items.length-10)+' more games</div>';
+  if(items.length>displayItems.length) h+='<div style="font-size:11px;color:var(--muted);text-align:center;padding:4px">+'+(items.length-displayItems.length)+' more games</div>';
   return h+'</div>';
 }
 function chessComTodayDisplayData(games){
@@ -4638,7 +4761,7 @@ function renderChessCom(){
   const prDailyDisplaySeconds=estimateChessComPuzzleRushDisplaySeconds(prDaily&&prDaily.totalAttempts);
   const prStr=prDaily?(' &nbsp;·&nbsp; Puzzle Rush daily stat: <strong>'+prDaily.score+'</strong> ('+prDaily.totalAttempts+' attempts'+(prDailyDisplaySeconds?' · est. '+fmtT(prDailyDisplaySeconds):'')+')'):'';
   const todayDisplay=chessComTodayDisplayData(todayG);
-  const recentDisplay=chessComRecentDisplayData((ccData.games||[]).slice(0,5));
+  const recentDisplay=chessComRecentDisplayData(getChessComRecentGamesForDisplay());
 
   h+='<div class="cc-today-summary">'
     +'<strong>Today:</strong> '+todayG.length+' game'+(todayG.length!==1?'s':'')+' played';
@@ -4707,10 +4830,7 @@ function syncLichessGamesToHistory(reason){
     lcData.history={rapid:(c.history&&c.history.rapid)||{},blitz:(c.history&&c.history.blitz)||{},bullet:(c.history&&c.history.bullet)||{},puzzle:(c.history&&c.history.puzzle)||{}};
     lcData.lastFetch=c.lastFetch||0;
     if(lcData.recentGames.length&&syncLichessGamesToHistory('cache_restore')) persist();
-    // Default behavior: always refresh external data on page load.
-    if(state.autoRefreshExternalOnLoad!==false){
-      setTimeout(()=>lcFetch(),stale||missingHistory?350:800);
-    }
+    setTimeout(()=>lcFetch(),stale||missingHistory?350:800);
   } else {
     if(state.lcCache && !sameUser(state.lcCache.username,getLCUser())) delete state.lcCache;
     // No cache yet — auto-fetch on startup (username defaults to 'thefrenkel')
@@ -4723,7 +4843,7 @@ function lcFetch(){
   lcData.loading=true; lcData.error=null;
   render();
 
-  const lookbackStart=pd(externalGameSyncStartKey());
+  const lookbackStart=pd(externalGameDisplayStartKey());
   lookbackStart.setHours(0,0,0,0);
   const sinceMs=lookbackStart.getTime();
   const user=getLCUser();
@@ -4732,8 +4852,8 @@ function lcFetch(){
   Promise.all([
     // Profile + ratings
     fetch('https://lichess.org/api/user/'+userPath,{headers:{Accept:'application/json'}}).then(r=>{if(!r.ok)throw new Error('Profile: '+r.status);return r.json()}),
-    // Today's games (NDJSON)
-    fetch('https://lichess.org/api/games/user/'+userPath+'?since='+sinceMs+'&max=50',{headers:{Accept:'application/x-ndjson'}}).then(r=>{if(!r.ok)throw new Error('Games: '+r.status);return r.text()}),
+    // Recent games (NDJSON)
+    fetch('https://lichess.org/api/games/user/'+userPath+'?since='+sinceMs+'&max=100',{headers:{Accept:'application/x-ndjson'}}).then(r=>{if(!r.ok)throw new Error('Games: '+r.status);return r.text()}),
     // Puzzle storm dashboard
     fetch('https://lichess.org/api/storm/dashboard/'+userPath,{headers:{Accept:'application/json'}}).then(r=>{if(!r.ok)return null;return r.json()}).catch(()=>null),
     fetch('https://lichess.org/api/user/'+userPath+'/activity',{headers:{Accept:'application/json'}}).then(r=>{if(!r.ok)return [];return r.json()}).catch(()=>[]),
@@ -4827,6 +4947,21 @@ function getLichessGamesForDay(dayKey){
     seen.add(key);
     return true;
   });
+}
+function getLichessRecentGamesForDisplay(){
+  const seen=new Set();
+  return (Array.isArray(lcData.recentGames)?lcData.recentGames:[])
+    .filter(function(game){
+      return game&&getLichessGameMs(game)&&normalizeGameType((game&&game.perf)||(game&&game.speed));
+    })
+    .sort(function(a,b){return getLichessGameMs(b)-getLichessGameMs(a);})
+    .filter(function(game){
+      const key=(game&&game.id)||String(getLichessGameMs(game))+'_'+((game&&game.speed)||'')+'_'+((game&&game.perf)||'');
+      if(seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0,EXTERNAL_GAME_PANEL_LIMIT);
 }
 function lichessTodayDisplayData(games){
   const list=Array.isArray(games)?games:[];
@@ -4969,7 +5104,7 @@ function renderLichess(){
   const tDraws=tg.length-tWins-tLosses;
   const tacticsGoal=getDay(NOW()).tacticsGoal||500;
   const todayDisplay=lichessTodayDisplayData(tg);
-  const recentDisplay=lichessRecentDisplayData((lcData.recentGames||[]).slice(0,5));
+  const recentDisplay=lichessRecentDisplayData(getLichessRecentGamesForDisplay());
 
   // Storm today data
   let stormTodayStr='';
@@ -6091,11 +6226,180 @@ function cloudGamesFromBackup(backup,dashboard){
 function cloudClone(value){
   try{return JSON.parse(JSON.stringify(value))}catch(_err){return value}
 }
+function cloudMergeTask(localTask,remoteTask){
+  const local=cloneTask(localTask);
+  const remote=cloneTask(remoteTask);
+  return {
+    done:local.done||remote.done,
+    elapsedSeconds:Math.max(local.elapsedSeconds,remote.elapsedSeconds),
+    timerRunning:local.timerRunning||remote.timerRunning,
+    timerStartedAt:local.timerRunning?local.timerStartedAt:(remote.timerRunning?remote.timerStartedAt:null),
+    count:Math.max(local.count,remote.count)
+  };
+}
+function cloudMergeCountSeconds(localValue,remoteValue){
+  return {
+    elapsedSeconds:Math.max(Number(localValue&&localValue.elapsedSeconds)||0,Number(remoteValue&&remoteValue.elapsedSeconds)||0),
+    count:Math.max(Number(localValue&&localValue.count)||0,Number(remoteValue&&remoteValue.count)||0)
+  };
+}
+function cloudMergeExternalGameEntry(localEntry,remoteEntry){
+  const local=localEntry&&typeof localEntry==='object'?localEntry:{};
+  const remote=remoteEntry&&typeof remoteEntry==='object'?remoteEntry:{};
+  const localSyncedAt=Number(local.syncedAt)||0;
+  const remoteSyncedAt=Number(remote.syncedAt)||0;
+  if(isExternalGameClearEntry(local)||isExternalGameClearEntry(remote)){
+    return normalizeExternalGameSyncEntry(localSyncedAt>=remoteSyncedAt?local:remote);
+  }
+  const byType={};
+  Object.keys(gameTypeBreakdown()).forEach(function(type){
+    byType[type]=Math.max(Number(local.byType&&local.byType[type])||0,Number(remote.byType&&remote.byType[type])||0);
+  });
+  const latest=localSyncedAt>=remoteSyncedAt?local:remote;
+  return {
+    games:Math.max(Number(local.games)||0,Number(remote.games)||0,sumGameBreakdownCounts(byType)),
+    byType:byType,
+    autoSeconds:Math.max(Number(local.autoSeconds)||0,Number(remote.autoSeconds)||0,estimateGameBreakdownAutoSeconds(byType)),
+    points:Math.max(Number(local.points)||0,Number(remote.points)||0),
+    scoreText:local.scoreText||remote.scoreText||'',
+    latestType:normalizeGameType(latest.latestType)||(Object.keys(byType).filter(function(type){return byType[type]>0}).sort(function(a,b){return byType[b]-byType[a]})[0]||''),
+    syncedAt:Math.max(localSyncedAt,remoteSyncedAt)
+  };
+}
+function cloudMergeExternalGameSync(localSync,remoteSync){
+  const merged={};
+  const keys=new Set(Object.keys(localSync||{}).concat(Object.keys(remoteSync||{})));
+  keys.forEach(function(platform){
+    if(!GAME_PLATFORMS[platform]) return;
+    merged[platform]=cloudMergeExternalGameEntry(
+      localSync&&localSync[platform],
+      remoteSync&&remoteSync[platform]
+    );
+  });
+  return merged;
+}
+function cloudExternalGameClearWinner(localSync,remoteSync){
+  let winner='';
+  let winnerSyncedAt=0;
+  Object.keys(GAME_PLATFORMS).forEach(function(platform){
+    const localEntry=localSync&&localSync[platform];
+    const remoteEntry=remoteSync&&remoteSync[platform];
+    const localSyncedAt=Number(localEntry&&localEntry.syncedAt)||0;
+    const remoteSyncedAt=Number(remoteEntry&&remoteEntry.syncedAt)||0;
+    if(isExternalGameClearEntry(localEntry)&&localSyncedAt>=remoteSyncedAt&&localSyncedAt>=winnerSyncedAt){
+      winner='local';
+      winnerSyncedAt=localSyncedAt;
+    }
+    if(isExternalGameClearEntry(remoteEntry)&&remoteSyncedAt>=localSyncedAt&&remoteSyncedAt>=winnerSyncedAt){
+      winner='remote';
+      winnerSyncedAt=remoteSyncedAt;
+    }
+  });
+  return winner;
+}
+function cloudMergeKeyedObjects(localObj,remoteObj){
+  const merged={...(remoteObj&&typeof remoteObj==='object'?cloudClone(remoteObj):{})};
+  Object.keys(localObj&&typeof localObj==='object'?localObj:{}).forEach(function(key){
+    const localVal=localObj[key];
+    const remoteVal=merged[key];
+    let localScore=0,remoteScore=0;
+    try{localScore=JSON.stringify(localVal).length}catch(_err){}
+    try{remoteScore=JSON.stringify(remoteVal).length}catch(_err){}
+    merged[key]=localScore>=remoteScore?cloudClone(localVal):remoteVal;
+  });
+  return merged;
+}
+function cloudMergeTrackerSync(localSync,remoteSync){
+  const localAt=Number(localSync&&localSync.receivedAt)||Number(localSync&&localSync.timestamp)||0;
+  const remoteAt=Number(remoteSync&&remoteSync.receivedAt)||Number(remoteSync&&remoteSync.timestamp)||0;
+  return localAt>=remoteAt?(localSync||remoteSync||null):(remoteSync||localSync||null);
+}
+function cloudMergeTrackerSessions(localSessions,remoteSessions){
+  const byId={};
+  function sessionAt(session){
+    return Number(session&&session.timestamp)||Number(session&&session.receivedAt)||0;
+  }
+  function push(session){
+    const normalized=normalizeTrackerSessionEntry(session,'');
+    if(!normalized) return;
+    const id=normalized.id;
+    const current=byId[id];
+    if(!current||sessionAt(session)>=sessionAt(current)) byId[id]=cloudClone(session);
+  }
+  (Array.isArray(remoteSessions)?remoteSessions:[]).forEach(push);
+  (Array.isArray(localSessions)?localSessions:[]).forEach(push);
+  return Object.keys(byId).map(function(id){return byId[id]}).sort(function(a,b){return sessionAt(a)-sessionAt(b)}).slice(-50);
+}
+function cloudMergeTrackerExtras(localExtras,remoteExtras){
+  const merged={...(remoteExtras&&typeof remoteExtras==='object'?cloudClone(remoteExtras):{}),...(localExtras&&typeof localExtras==='object'?cloudClone(localExtras):{})};
+  const sessions=cloudMergeTrackerSessions(
+    localExtras&&localExtras.chessTrackerSessions,
+    remoteExtras&&remoteExtras.chessTrackerSessions
+  );
+  if(sessions.length) merged.chessTrackerSessions=sessions;
+  const appliedIds=new Set([].concat(
+    Array.isArray(remoteExtras&&remoteExtras.appliedTrackerSessionIds)?remoteExtras.appliedTrackerSessionIds:[],
+    Array.isArray(localExtras&&localExtras.appliedTrackerSessionIds)?localExtras.appliedTrackerSessionIds:[]
+  ).map(function(id){return String(id||'').trim()}).filter(Boolean));
+  if(appliedIds.size) merged.appliedTrackerSessionIds=Array.from(appliedIds).slice(-100);
+  return merged;
+}
+function cloudMergeHistoryDay(dayKey,localDay,remoteDay){
+  const local=localDay&&typeof localDay==='object'?localDay:{};
+  const remote=remoteDay&&typeof remoteDay==='object'?remoteDay:{};
+  const merged={...cloudClone(remote),...cloudClone(local)};
+  merged.tasks={};
+  TK.forEach(function(key){
+    merged.tasks[key]=cloudMergeTask(local.tasks&&local.tasks[key],remote.tasks&&remote.tasks[key]);
+  });
+  merged.openingBreakdown={
+    white:cloudMergeCountSeconds(local.openingBreakdown&&local.openingBreakdown.white,remote.openingBreakdown&&remote.openingBreakdown.white),
+    black:cloudMergeCountSeconds(local.openingBreakdown&&local.openingBreakdown.black,remote.openingBreakdown&&remote.openingBreakdown.black)
+  };
+  merged.tacticsBreakdown={};
+  Object.keys(TACTIC_TOOLS).forEach(function(tool){
+    merged.tacticsBreakdown[tool]=cloudMergeCountSeconds(local.tacticsBreakdown&&local.tacticsBreakdown[tool],remote.tacticsBreakdown&&remote.tacticsBreakdown[tool]);
+  });
+  merged.openingCourses=cloudMergeKeyedObjects(local.openingCourses,remote.openingCourses);
+  merged.tacticsCourses=cloudMergeKeyedObjects(local.tacticsCourses,remote.tacticsCourses);
+  merged.lastExternalGameSync=cloudMergeExternalGameSync(local.lastExternalGameSync,remote.lastExternalGameSync);
+  const totals=summarizeExternalGamePlatforms(merged);
+  const externalGamesClearWinner=totals.games?'':cloudExternalGameClearWinner(local.lastExternalGameSync,remote.lastExternalGameSync);
+  if(totals.games){
+    merged.tasks.games.count=Math.max(merged.tasks.games.count,totals.games);
+    merged.tasks.games.elapsedSeconds=Math.max(merged.tasks.games.elapsedSeconds,totals.autoSeconds);
+    merged.tasks.games.done=true;
+    if(totals.latestPlatform&&GAME_PLATFORMS[totals.latestPlatform]) merged.gamePlatform=totals.latestPlatform;
+    if(totals.latestType&&GAME_TYPES[totals.latestType]) merged.gameType=totals.latestType;
+    if(!String(merged.dailyScore||'').trim()&&totals.scoreText) merged.dailyScore=totals.scoreText;
+  }else if(externalGamesClearWinner){
+    const clearSource=externalGamesClearWinner==='local'?local:remote;
+    merged.tasks.games=cloneTask(clearSource.tasks&&clearSource.tasks.games);
+    merged.dailyScore=clearSource.dailyScore||'';
+  }
+  if(!externalGamesClearWinner&&!String(merged.dailyScore||'').trim()&&String(remote.dailyScore||'').trim()) merged.dailyScore=remote.dailyScore;
+  if(!String(merged.dailyElo||'').trim()&&String(remote.dailyElo||'').trim()) merged.dailyElo=remote.dailyElo;
+  if(!String(merged.notes||'').trim()&&String(remote.notes||'').trim()) merged.notes=remote.notes;
+  merged.started=!!(local.started||remote.started||TK.some(function(key){return taskHasRecordedData(merged.tasks[key])}));
+  merged.completedAt=local.completedAt||remote.completedAt||null;
+  merged.lastTrackerSync=cloudMergeTrackerSync(local.lastTrackerSync,remote.lastTrackerSync);
+  merged.extras=cloudMergeTrackerExtras(local.extras,remote.extras);
+  return safeNormalizeDay(dayKey,merged);
+}
 function cloudMergeDashboardStates(localDashboard,remoteDashboard){
-  const merged=cloudClone(localDashboard||remoteDashboard||{history:{}});
+  const merged={...cloudClone(remoteDashboard||{}),...cloudClone(localDashboard||{}),history:{}};
+  const localHistory=localDashboard&&localDashboard.history&&typeof localDashboard.history==='object'?localDashboard.history:{};
+  const remoteHistory=remoteDashboard&&remoteDashboard.history&&typeof remoteDashboard.history==='object'?remoteDashboard.history:{};
+  const dayKeys=new Set(Object.keys(remoteHistory).concat(Object.keys(localHistory)));
+  dayKeys.forEach(function(dayKey){
+    merged.history[dayKey]=cloudMergeHistoryDay(dayKey,localHistory[dayKey],remoteHistory[dayKey]);
+  });
   if(!merged.history||typeof merged.history!=='object') merged.history={};
-  if(remoteDashboard) mergeRecoverySnapshot(merged,cloudClone(remoteDashboard));
-  if(localDashboard) mergeRecoverySnapshot(merged,cloudClone(localDashboard));
+  merged.lastTrackerSync=cloudMergeTrackerSync(localDashboard&&localDashboard.lastTrackerSync,remoteDashboard&&remoteDashboard.lastTrackerSync);
+  merged.cvCache=(localDashboard&&localDashboard.cvCache)||(remoteDashboard&&remoteDashboard.cvCache);
+  merged.cvHistory=cloudMergeKeyedObjects(localDashboard&&localDashboard.cvHistory,remoteDashboard&&remoteDashboard.cvHistory);
+  merged.ccCache=(localDashboard&&localDashboard.ccCache)||(remoteDashboard&&remoteDashboard.ccCache);
+  merged.lcCache=(localDashboard&&localDashboard.lcCache)||(remoteDashboard&&remoteDashboard.lcCache);
   return merged;
 }
 function cloudMergeGames(localGamesState,remoteGamesState){
@@ -6432,6 +6736,10 @@ function showStartupFailure(err){
       var trackedDay = ensureDay(sync.dateKey);
       var originalTaskKey=sync.taskKey;
       sync.taskKey=normalizeChessableSyncTaskKey(sync.taskKey,sync.source,sync.courseName)||sync.taskKey;
+      if(sync.taskKey==='tactics'&&String(sync.source||'').trim().toLowerCase()==='lichess'){
+        sync.source='lichess';
+        sync.addSeconds=normalizeLichessTacticsSyncSeconds(sync.addCount,sync.addSeconds);
+      }
       var receivedAt=Date.now();
       var storedSession=upsertStoredTrackerSession(trackedDay,{
         syncId:sync.syncId,
